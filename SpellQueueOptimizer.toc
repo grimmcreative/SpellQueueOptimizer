@@ -1,0 +1,11 @@
+## Interface: 110002
+## Title: SpellQueueOptimizer
+## Notes: Automatically optimizes the SpellQueueWindow (SQW) based on your latency, class and specialization. Adjusts on login, spec/zone change, and at intervals.
+## Author: Maximilian Anton Grimm | grimm@grimmcreative.com
+## Version: 1.0.0
+## SavedVariables: SpellQueueOptimizerDB
+## X-Category: Combat
+## X-Website: https://www.curseforge.com/wow/addons/spellqueueoptimizer
+## X-Email: grimm@grimmcreative.com
+
+SpellQueueOptimizer.lua
