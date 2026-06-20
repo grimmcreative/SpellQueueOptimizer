@@ -2,11 +2,16 @@
 
 Automatically optimizes the SpellQueueWindow (SQW) in World of Warcraft based on your latency and specialization.
 
+Compatible with **Midnight (Patch 12.0)**.
+
 ## Features
 - Reads latency and specialization to compute an optimal SQW value.
+- Tuning follows current guidance: baseline 200 ms + ping, clamped 200–400 ms,
+  with small per-spec corrections.
 - Adjusts on login, spec/zone changes, and periodically (default 5 minutes).
+- Combat-safe: changes are deferred during combat and applied when it ends
+  (required since 12.0 locks secure CVars in combat).
 - Slash commands for manual control and override.
-- Sensible defaults with clamps and rounding.
 
 ## Installation
 1. Download and unzip the addon.

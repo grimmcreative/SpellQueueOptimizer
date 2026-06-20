@@ -1,12 +1,19 @@
 --[[--------------------------------------------------------------------
  SpellQueueOptimizer
  Author: Maximilian Anton Grimm | grimm@grimmcreative.com
- Version: 1.0.0
+ Version: 1.1.0
 
  Purpose:
    Automatically tunes the SpellQueueWindow (SQW) to a sensible value
    derived from your current latency (GetNetStats) and specialization.
    Runs on login/zone/spec change and periodically.
+
+ Midnight (12.0) notes:
+   - Uses C_CVar / C_SpecializationInfo namespaces (with legacy fallbacks).
+   - Secure CVars can no longer be set during combat; changes are deferred
+     and re-applied on PLAYER_REGEN_ENABLED (combat end).
+   - Tuning follows current guidance: baseline 200 ms + ping, clamped
+     200..400 ms, with small per-spec corrections.
 
  License:
    You may use, modify, and redistribute this addon with attribution.
@@ -32,6 +39,18 @@ local function Print(msg)
   end
 end
 
+-- API shims: prefer modern C_* namespaces (Midnight 12.0), fall back to globals.
+local function GetSQW()
+  local get = (C_CVar and C_CVar.GetCVar) or GetCVar
+  return tonumber(get("SpellQueueWindow")) or 0
+end
+
+-- Returns true if the value was applied, false if it could not be (e.g. combat).
+local function SetSQW(v)
+  local set = (C_CVar and C_CVar.SetCVar) or SetCVar
+  return set("SpellQueueWindow", v) ~= false
+end
+
 -- Utility: clamp number
 local function Clamp(v, minv, maxv)
   if v < minv then return minv end
@@ -44,10 +63,11 @@ local function RoundToNearest10(x)
   return math.floor((x + 5) / 10) * 10
 end
 
--- Spec categories (coarse buckets)
--- channel_heavy  : benefits from a slightly larger SQW for smooth channel clipping/queuing
--- proc_reactive  : too large SQW may swallow reactive inputs
--- burst_precise  : generally prefers a tighter SQW window
+-- Spec categories (coarse buckets) — used as SMALL corrections on top of the
+-- ping-based baseline, not as the primary driver.
+-- channel_heavy  : a touch more buffer for smooth channel clipping/queuing
+-- proc_reactive  : slightly tighter so reactive inputs aren't swallowed
+-- burst_precise  : neutral (uses the baseline)
 local SPEC_CHANNEL_HEAVY = {
   [258] = true,   -- Priest: Shadow
   [270] = true,   -- Monk: Mistweaver
@@ -77,29 +97,29 @@ local SPEC_BURST_PRECISE = {
 }
 
 -- Compute target SQW (ms) from latency and spec bucket.
--- Baseline:
---   channel_heavy : ping * 3.0, clamped  90..140
---   proc_reactive : ping * 2.5, clamped  70..110
---   burst_precise : ping * 2.0, clamped  60..100
--- Rounded to 10 ms. On typical EU pings (20–35 ms) this yields ~80–110 ms.
+--
+-- Current guidance (Midnight 12.0 theorycrafting): a larger SQW is generally
+-- better for queue reliability. Keep it near the 400 ms cap; never go below
+-- ~200 ms + your ping. This addon therefore uses:
+--
+--   baseline   = 200 + ping
+--   correction = channel_heavy +30 | proc_reactive -20 | burst_precise 0
+--   result     = clamp(baseline + correction, 200, 400), rounded to 10 ms
+--
+-- On a typical EU ping (20–35 ms) this yields ~210–260 ms — well inside the
+-- recommended band, instead of the old aggressive 60–140 ms values.
 local function ComputeOptimalSQW(pingMs, specId)
-  if not pingMs or pingMs <= 0 then
-    return 100 -- safe default
-  end
+  local ping = (pingMs and pingMs > 0) and pingMs or 30 -- safe ping assumption
 
-  local raw
+  local correction = 0
   if SPEC_CHANNEL_HEAVY[specId] then
-    raw = pingMs * 3.0
-    raw = Clamp(raw, 90, 140)
+    correction = 30
   elseif SPEC_PROC_REACTIVE[specId] then
-    raw = pingMs * 2.5
-    raw = Clamp(raw, 70, 110)
-  else
-    -- default/fallback to burst_precise tuning
-    raw = pingMs * 2.0
-    raw = Clamp(raw, 60, 100)
-  end
+    correction = -20
+  end -- burst_precise / unknown: neutral
 
+  local raw = 200 + ping + correction
+  raw = Clamp(raw, 200, 400)
   return RoundToNearest10(raw)
 end
 
@@ -111,44 +131,62 @@ end
 
 -- Get current spec ID (e.g., 258 for Shadow)
 local function GetCurrentSpecID()
-  local specIndex = GetSpecialization and GetSpecialization()
+  local getSpec = (C_SpecializationInfo and C_SpecializationInfo.GetSpecialization) or GetSpecialization
+  local getInfo = (C_SpecializationInfo and C_SpecializationInfo.GetSpecializationInfo) or GetSpecializationInfo
+  if not getSpec or not getInfo then return nil end
+  local specIndex = getSpec()
   if not specIndex then return nil end
-  local specId = GetSpecializationInfo(specIndex)
-  return specId
+  return getInfo(specIndex)
 end
 
--- Core: evaluate and apply SQW
+-- Set true when a desired change could not be applied because we were in
+-- combat; PLAYER_REGEN_ENABLED then re-runs the evaluation.
+local pendingApply = false
+
+-- Core: evaluate and apply SQW.
+-- Returns the desired value so callers can re-use it.
 local function EvaluateAndApplySQW(reason)
   if not SpellQueueOptimizerDB.enabled then
     return
   end
 
-  -- Manual override takes precedence
+  -- Determine the desired value (override beats auto logic).
+  local desired, detail
   if SpellQueueOptimizerDB.override and tonumber(SpellQueueOptimizerDB.override) then
-    local overrideVal = tonumber(SpellQueueOptimizerDB.override)
-    local current = tonumber(GetCVar("SpellQueueWindow")) or 0
-    if current ~= overrideVal then
-      SetCVar("SpellQueueWindow", overrideVal)
-      Print(string.format("Override active – set SQW to %d ms (%s).", overrideVal, reason or ""))
-    else
-      Print(string.format("Override active – SQW already %d ms (%s).", overrideVal, reason or ""))
-    end
-    return
-  end
-
-  local home, world = GetCurrentPings()
-  local ping = math.max(home, world) -- conservative: use the worse value
-  local specId = GetCurrentSpecID() or 0
-  local optimal = ComputeOptimalSQW(ping, specId)
-
-  local current = tonumber(GetCVar("SpellQueueWindow")) or 0
-  if current ~= optimal then
-    SetCVar("SpellQueueWindow", optimal)
-    local specTxt = specId ~= 0 and ("SpecID " .. specId) or "unknown spec"
-    Print(string.format("Ping H/W: %d/%d ms → %s → SQW %d ms (%s).", home, world, specTxt, optimal, reason or ""))
+    desired = tonumber(SpellQueueOptimizerDB.override)
+    detail = "Override"
   else
-    Print(string.format("SQW already optimal (%d ms). Ping H/W: %d/%d ms (%s).", current, home, world, reason or ""))
+    local home, world = GetCurrentPings()
+    local ping = math.max(home, world) -- conservative: use the worse value
+    local specId = GetCurrentSpecID() or 0
+    desired = ComputeOptimalSQW(ping, specId)
+    detail = string.format("Ping H/W %d/%d ms, %s", home, world,
+      specId ~= 0 and ("SpecID " .. specId) or "unknown spec")
   end
+
+  local current = GetSQW()
+  if current == desired then
+    Print(string.format("SQW already %d ms (%s; %s).", current, detail, reason or ""))
+    pendingApply = false
+    return desired
+  end
+
+  -- Midnight: secure CVars cannot be set in combat. Defer if needed.
+  if InCombatLockdown() then
+    pendingApply = true
+    Print(string.format("In combat – will set SQW to %d ms after combat (%s).", desired, reason or ""))
+    return desired
+  end
+
+  if SetSQW(desired) then
+    pendingApply = false
+    Print(string.format("SQW %d → %d ms (%s; %s).", current, desired, detail, reason or ""))
+  else
+    -- Could not apply (e.g. protected). Try again after combat just in case.
+    pendingApply = true
+    Print(string.format("Could not set SQW right now; will retry (%s).", reason or ""))
+  end
+  return desired
 end
 
 -- Periodic ticker
@@ -170,6 +208,7 @@ f:RegisterEvent("PLAYER_LOGIN")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 f:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
 f:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+f:RegisterEvent("PLAYER_REGEN_ENABLED")
 f:RegisterEvent("CVAR_UPDATE")
 
 f:SetScript("OnEvent", function(_, event, arg1, _)
@@ -189,10 +228,15 @@ f:SetScript("OnEvent", function(_, event, arg1, _)
   elseif event == "ZONE_CHANGED_NEW_AREA" then
     -- world ping can shift on instance change
     EvaluateAndApplySQW("instance changed")
+  elseif event == "PLAYER_REGEN_ENABLED" then
+    -- combat ended: apply anything that was deferred during combat
+    if pendingApply then
+      EvaluateAndApplySQW("after combat")
+    end
   elseif event == "CVAR_UPDATE" then
     -- observe external changes to SpellQueueWindow
     if arg1 == "SpellQueueWindow" or arg1 == "spellqueuewindow" then
-      local v = tonumber(GetCVar("SpellQueueWindow")) or 0
+      local v = GetSQW()
       Print(string.format("CVar SpellQueueWindow changed → %d ms.", v))
     end
   end
@@ -208,7 +252,7 @@ SlashCmdList.SQO = function(msg)
     print("  /sqo now            - Recalculate & apply now")
     print("  /sqo on|off         - Enable/disable auto-optimization")
     print("  /sqo interval <s>   - Set interval 60..900 seconds (default 300)")
-    print("  /sqo set <ms>       - Set fixed override (e.g., /sqo set 100)")
+    print("  /sqo set <ms>       - Set fixed override (e.g., /sqo set 250)")
     print("  /sqo clear          - Remove override (return to auto mode)")
     print("  /sqo quiet|verbose  - Toggle chat verbosity")
     return
@@ -217,7 +261,7 @@ SlashCmdList.SQO = function(msg)
   local cmd, rest = msg:match("^(%S+)%s*(.*)$")
   if cmd == "show" then
     local home, world = GetCurrentPings()
-    local current = tonumber(GetCVar("SpellQueueWindow")) or 0
+    local current = GetSQW()
     local specId = GetCurrentSpecID() or 0
     local mode = (SpellQueueOptimizerDB.override and "Override")
               or (SpellQueueOptimizerDB.enabled and "Auto")
@@ -248,12 +292,11 @@ SlashCmdList.SQO = function(msg)
   elseif cmd == "set" then
     local v = tonumber(rest)
     if v then
-      v = Clamp(v, 10, 400) -- hard bounds (Blizzard uses 400 as default upper)
+      v = Clamp(v, 0, 400) -- hard bounds (Blizzard caps SQW at 400 ms)
       SpellQueueOptimizerDB.override = v
-      SetCVar("SpellQueueWindow", v)
-      Print("Override active → SQW set to " .. v .. " ms.")
+      EvaluateAndApplySQW("override set") -- handles combat deferral
     else
-      Print("Please provide milliseconds. Example: /sqo set 100")
+      Print("Please provide milliseconds. Example: /sqo set 250")
     end
   elseif cmd == "clear" then
     SpellQueueOptimizerDB.override = nil
